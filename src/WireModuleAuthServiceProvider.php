@@ -1,0 +1,347 @@
+<?php
+
+declare(strict_types=1);
+
+namespace NyonCode\WireModuleAuth;
+
+use Illuminate\Auth\Notifications\ResetPassword;
+use Illuminate\Support\Facades\Blade;
+use Illuminate\Support\Facades\View;
+use Laravel\Fortify\Contracts\RedirectsIfTwoFactorAuthenticatable;
+use Laravel\Fortify\Contracts\SuccessfulPasswordResetLinkRequestResponse;
+use Laravel\Fortify\Fortify;
+use NyonCode\LaravelPackageToolkit\Commands\InstallCommand;
+use NyonCode\LaravelPackageToolkit\Packager;
+use NyonCode\LaravelPackageToolkit\PackageServiceProvider;
+use NyonCode\WireCore\Core\Modules\Module;
+use NyonCode\WireCore\Foundation\View\PageChrome;
+use NyonCode\WireModuleAuth\Actions\MailResetCode;
+use NyonCode\WireModuleAuth\Actions\RedirectIfCodeRequired;
+use NyonCode\WireModuleAuth\Contracts\OneTimeCodes;
+use NyonCode\WireModuleAuth\Forms\AuthForms;
+use NyonCode\WireModuleAuth\Http\Responses\RedirectToResetCodeScreen;
+use NyonCode\WireModuleAuth\Install\LayoutScaffold;
+use NyonCode\WireModuleAuth\Services\DatabaseOneTimeCodes;
+use NyonCode\WireModuleAuth\Support\Codes;
+use NyonCode\WireModuleAuth\Support\Frame;
+use NyonCode\WireModuleAuth\Support\Screens;
+use NyonCode\WireModuleAuth\View\Screen;
+
+/**
+ * The signed-out surface, as a package.
+ *
+ * **Laravel Fortify owns authentication, and this package owns none of it.**
+ * The credential check, the login throttle keyed on address and IP, the session
+ * regeneration that closes fixation, the reset tokens and their expiry, the
+ * signed verification links, the TOTP window and the recovery codes are a
+ * security surface with a maintained owner. Re-implementing them here would buy
+ * this framework nothing and cost it every CVE.
+ *
+ * What Fortify deliberately does not have is a screen. It is headless: it ships
+ * the routes and asks the application for the markup, through seven view
+ * callbacks. Before this package, a wire application answered them itself — or
+ * more often did not, and installed the whole panel with no way to sign in to
+ * it. That is the gap, and it is exactly seven views wide.
+ *
+ * So this is not a {@see Module}, and the
+ * distinction is worth keeping: a module is a manifest of resources, dashboards
+ * and a navigation group (ADR 0029), and this package registers none of those —
+ * there is no admin page for authentication, only the pages on the way in. It
+ * ships in the same catalogue and under the same name because that is what an
+ * installer offers, not because it declares the same things.
+ */
+class WireModuleAuthServiceProvider extends PackageServiceProvider
+{
+    /**
+     * @throws \Exception
+     */
+    public function configure(Packager $packager): void
+    {
+        $packager
+            ->name('WireModuleAuth')
+            ->hasShortName('wire-module-auth')
+            ->hasConfig()
+            ->hasViews()
+            ->hasRoutes()
+            ->hasMigrations()
+            ->hasTranslations()
+            // One registry for the whole signed-out surface, resolved before any
+            // provider boots: an application adjusts a screen's fields in its
+            // own `boot()`, and a second instance handed out there would collect
+            // callbacks nothing renders.
+            ->registeringPackage(function (): void {
+                $this->app->singleton(AuthForms::class);
+
+                // The store, bound in `register()` so an application's own
+                // provider — which registers later — can put a different one in
+                // front of it without racing this. `bind` rather than
+                // `singleton`: it holds no state, and a long-lived connection
+                // handle inside a container singleton is a queue worker's
+                // problem later.
+                $this->app->bind(OneTimeCodes::class, fn ($app) => new DatabaseOneTimeCodes($app->make('db')->connection()));
+            })
+            ->bootedPackage(function (): void {
+                Blade::component('wire-module-auth::screen', Screen::class);
+
+                // Every screen renders its fields from the registry, and the
+                // registry reaches them from here rather than from nine copies
+                // of `app(...)` in the templates: a view that resolves out of
+                // the container is a view doing PHP's job (Rendering Rule 1),
+                // and nine of them are nine places to keep in step.
+                //
+                // A composer rather than data passed at the call site, because
+                // these views have two callers — Fortify's view callbacks and
+                // this package's own code-flow routes — and an application may
+                // render one directly as a third.
+                View::composer(
+                    'wire-module-auth::*',
+                    fn ($view) => $view->with('forms', $this->app->make(AuthForms::class)),
+                );
+
+                $this->registerScreens();
+                $this->registerSignOut();
+                $this->registerCodeFlows();
+            })
+            ->hasInstallCommand(function (InstallCommand $command): void {
+                $command
+                    ->publishConfig()
+                    ->publishTranslations()
+                    // Published rather than run from the package, like every
+                    // other table in this repository: what the codes are stored
+                    // in is the application's schema, and an application that
+                    // uses none of the flows should not be handed a table it
+                    // never asked for.
+                    ->publishMigrations()
+                    ->afterInstallation(fn (InstallCommand $installer) => $this->reportEnvironment($installer));
+            })
+            ->hasAbout();
+    }
+
+    /**
+     * Answer Fortify's seven view callbacks.
+     *
+     * All seven, unconditionally, rather than one per enabled feature: a view
+     * for a feature that is off is never routed to, so gating them here would be
+     * a second copy of `fortify.features` that can disagree with the first.
+     *
+     * In **booted**, so an application's own provider — which boots after every
+     * package's — can name a view of its own for any of them and win. That is
+     * the documented way to keep six of these and replace the seventh.
+     */
+    protected function registerScreens(): void
+    {
+        if (! config('wire-module-auth.views', true)) {
+            return;
+        }
+
+        Fortify::loginView('wire-module-auth::login');
+        Fortify::registerView('wire-module-auth::register');
+        Fortify::requestPasswordResetLinkView('wire-module-auth::forgot-password');
+        Fortify::resetPasswordView('wire-module-auth::reset-password');
+        Fortify::verifyEmailView('wire-module-auth::verify-email');
+        Fortify::confirmPasswordView('wire-module-auth::confirm-password');
+        Fortify::twoFactorChallengeView('wire-module-auth::two-factor-challenge');
+    }
+
+    /**
+     * Put the way out in the user menu.
+     *
+     * Registered on the config alone, and **not** on whether the shell is here:
+     * provider order is composer's discovery order, so a shell that boots after
+     * this would fail the check and the entry would be missing from a menu that
+     * exists — installed, silent, empty, which is the failure ADR 0029 spent a
+     * decision on. Whether there is a shell to draw a row for is a question the
+     * view asks at render, where the answer is final.
+     *
+     * Sorted after the profile link the users module contributes, for the same
+     * reason: "Sign out" above "Profile" reads as a bug, and neither package can
+     * see the other to avoid it.
+     */
+    protected function registerSignOut(): void
+    {
+        if (! config('wire-module-auth.user_menu', true)) {
+            return;
+        }
+
+        $this->app->make(PageChrome::class)->add(
+            'wire-module-auth::user-menu',
+            PageChrome::USER_MENU,
+            sort: 100,
+        );
+    }
+
+    /**
+     * Wire whichever code flows are switched on, and nothing else.
+     *
+     * Two of the four need no wiring at all — their routes are their whole
+     * surface — and the two here both work by *replacing a Fortify binding*
+     * rather than by adding a parallel path (ADR 0037 §2):
+     *
+     *  - the second factor binds the contract Fortify's own login pipeline
+     *    resolves, so the mailed code is inserted into that pipeline without a
+     *    copy of it existing anywhere;
+     *  - the reset flow replaces the mail Laravel's broker sends and the
+     *    response Fortify returns after sending it. The token, its expiry and
+     *    the reset itself are untouched.
+     *
+     * In `booted`, like the screens, so an application that binds its own wins.
+     */
+    protected function registerCodeFlows(): void
+    {
+        if (Codes::secondFactor()) {
+            $this->app->singleton(RedirectsIfTwoFactorAuthenticatable::class, RedirectIfCodeRequired::class);
+        }
+
+        if (Codes::resetPassword()) {
+            // Resolved when the mail is built, not now: the callback outlives
+            // this boot, and an application (or a test) that puts its own store
+            // in front of `OneTimeCodes` afterwards would otherwise be talking
+            // to one instance while the mail minted codes into another.
+            ResetPassword::toMailUsing(fn ($notifiable, string $token) => $this->app->make(MailResetCode::class)($notifiable, $token));
+
+            $this->app->bind(SuccessfulPasswordResetLinkRequestResponse::class, RedirectToResetCodeScreen::class);
+        }
+    }
+
+    /**
+     * Say what this installation actually got, and what it still owes.
+     *
+     * Both halves are things an application would otherwise find out from a
+     * user: a login screen with no frame to render in, and a panel whose routes
+     * let anyone in.
+     */
+    protected function reportEnvironment(InstallCommand $command): void
+    {
+        $command->comment('  ✅ Fortify\'s screens are answered — login, reset, verification, two-factor');
+
+        foreach ($this->codeReport() as $line) {
+            $command->comment($line);
+        }
+
+        $this->scaffoldLayout($command);
+
+        foreach ($this->routeGuardReport() as $line) {
+            $command->comment($line);
+        }
+    }
+
+    /**
+     * Write the application's own signed-out layout, where there is a frame for
+     * it to name.
+     *
+     * Only with the shell installed, because the stub names the shell's frame.
+     * Without one there is nothing to write that would be true, so the line an
+     * application needs is the config key — which is what it gets instead of a
+     * file it would have to rewrite.
+     *
+     * Allowed to abort the run: the toolkit deliberately does not wrap install
+     * hooks in a try/catch, and an installer that cannot write the one file the
+     * screens' styling hangs on should stop rather than print a summary.
+     */
+    protected function scaffoldLayout(InstallCommand $command): void
+    {
+        if (! Frame::hasShell()) {
+            $command->comment('  ↩︎  No shell: name your own layout in config/wire-module-auth.php — the screens and the sign-out entry render in it');
+
+            return;
+        }
+
+        $command->comment((new LayoutScaffold($this->app->basePath()))->write()
+            ? '  ✅ Wrote '.LayoutScaffold::PATH.' — your stylesheet loads on the sign-in screens'
+            : '  ↩︎  '.LayoutScaffold::PATH.' already exists — left as it is');
+    }
+
+    /**
+     * What the code flows are, and the one way they can be on and useless.
+     *
+     * The stranded second factor is worth its own line: config says yes,
+     * Fortify's feature says no, and the consequence is a sign-in that asks for
+     * nothing. Reported rather than fixed here — turning Fortify's feature on
+     * from a package would bring its routes and its profile card with it, as a
+     * side effect of an unrelated switch (ADR 0037 §5).
+     *
+     * @return array<int, string>
+     */
+    protected function codeReport(): array
+    {
+        $lines = [];
+
+        if (Codes::secondFactorIsStranded()) {
+            $lines[] = '  ⚠️  Codes: the mailed second factor is on, but Fortify\'s two-factor feature is off — no code will be sent';
+        }
+
+        $flows = array_keys(array_filter([
+            'sign-in' => Codes::login(),
+            'second factor' => Codes::secondFactor(),
+            'address confirmation' => Codes::verifyEmail(),
+            'password reset' => Codes::resetPassword(),
+        ]));
+
+        if ($flows !== []) {
+            $lines[] = '  ✅ One-time codes: '.implode(', ', $flows);
+            $lines[] = '  • Run: php artisan migrate (the codes need their table)';
+        }
+
+        return $lines;
+    }
+
+    /**
+     * Whether anything actually stands between a visitor and the panel.
+     *
+     * Measured off the routing config rather than assumed: a login screen in
+     * front of an unguarded panel is decoration, and every diagnostic short of
+     * visiting the URL signed out reports success.
+     *
+     * @return array<int, string>
+     */
+    protected function routeGuardReport(): array
+    {
+        if (! config('wire-panels.routes.enabled', false)) {
+            // The routes are the application's own, written in its route file
+            // inside whatever group it chose. Nothing here can read that, and
+            // guessing would be worse than the line below.
+            return ['  ↩︎  Your pages are routed by hand — make sure the group they are in has the `auth` middleware'];
+        }
+
+        $middleware = (array) config('wire-panels.routes.middleware', []);
+
+        return [
+            in_array('auth', $middleware, true)
+                ? '  ✅ The panel routes require a signed-in user'
+                : '  ⚠️  wire-panels.routes.middleware has no `auth` — your panel is reachable signed out',
+        ];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public function aboutData(): array
+    {
+        return [
+            'Screens' => config('wire-module-auth.views', true) ? 'answered by wire-module-auth' : 'left to the application',
+            'Frame' => Frame::hasApplicationLayout() || Frame::hasShell()
+                ? Frame::component()
+                : (string) config('wire-module-auth.layout'),
+            'Registration' => Screens::canRegister() ? 'open' : 'closed',
+            'Two-factor' => Screens::hasTwoFactor() ? 'enabled' : 'off',
+            'One-time codes' => $this->codeSummary(),
+        ];
+    }
+
+    /** The four switches in one line, and the one state that is a warning. */
+    protected function codeSummary(): string
+    {
+        if (Codes::secondFactorIsStranded()) {
+            return 'second factor on, but Fortify two-factor is off';
+        }
+
+        $flows = array_keys(array_filter([
+            'sign-in' => Codes::login(),
+            'second factor' => Codes::secondFactor(),
+            'verification' => Codes::verifyEmail(),
+            'reset' => Codes::resetPassword(),
+        ]));
+
+        return $flows === [] ? 'off' : implode(', ', $flows);
+    }
+}
